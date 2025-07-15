@@ -11,6 +11,8 @@ namespace internode {
 
 extern nvshmem_team_t cpu_rdma_team;
 
+// SourceMeta 用于指示对应 token 来自哪个 RDMA rank
+// 以及在 node 内（NVLink rank）是否出现
 struct SourceMeta {
     int src_rdma_rank, is_token_in_nvl_rank_bits;
 
@@ -338,6 +340,12 @@ constexpr int get_num_topk_rdma_ranks(int num_rdma_ranks) {
     return num_rdma_ranks < 8 ? num_rdma_ranks : 8;
 }
 
+/**
+ * @param rdma_channel_prefix_matrix[i, j]: 发往 node i，经过 channel j 的 token 数，在 channel 维度上进行 prefix sum
+ *      每个 channel 就知道自己的起始 offset 在哪了
+ * @param recv_rdma_channel_prefix_matrix[i, j]: 同一个 NVLink rank，跨node经过 channel j 从 node i 收到的 token数，
+ *      在 channel 维度上进行 prefix sum，这样channel 写入的起始 offset 就决定了
+*/
 template <bool kLowLatencyMode, int kNumRDMARanks, bool kCachedMode, int kNumTMABytesPerWarp,
           int kNumDispatchRDMASenderWarps, int kNumTopkRDMARanks = get_num_topk_rdma_ranks(kNumRDMARanks)>
 __global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32), 1)
@@ -371,6 +379,10 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
     EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe == num_channels or ibgda_get_state()->num_rc_per_pe >= num_sms);
 
+    // num_threads: (kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32 = 512 (前者固定 7)
+    // num_blocks (sm): 2 * channels 
+    // 偶数用于进行 forward 操作相关，奇数负责 send/recv，假设还是20个block，可知一共有 16 个 warp，半数 forward 半数 coordinator
+    // 7 个 warp 用于 RDMA sender，一个用于 coordinator，剩下八个用于 Receiver
     const auto role_meta = [=]() -> std::pair<WarpRole, int> {
         if (is_forwarder) {
             if (warp_id < NUM_MAX_NVL_PEERS) {
@@ -399,6 +411,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     auto scale_bytes = num_scales * sizeof(float);
     // TODO: rename `num_bytes_per_rdma_token` after combine refactor
     auto num_bytes_per_token = get_num_bytes_per_token(hidden_int4, num_scales, num_topk, num_topk);
+    // 对称 buffer？所有 SM（包括不同的GPU）中的发送、接收buffer地址计算一致，计算规则相同。注意 input ptr 也会被修改
     auto rdma_channel_data = SymBuffer<uint8_t>(rdma_buffer_ptr, num_max_rdma_chunked_recv_tokens * num_bytes_per_token, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_meta = SymBuffer<int>(rdma_buffer_ptr, NUM_MAX_NVL_PEERS * 2 + 2, kNumRDMARanks, channel_id, num_channels);
     auto rdma_channel_head = SymBuffer<uint64_t, false>(rdma_buffer_ptr, 1, kNumRDMARanks, channel_id, num_channels);
@@ -408,6 +421,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     // NOTES: `rs_wr_buffer_ptr` means "Read for Senders, Write for Receivers", `ws_rr_buffer_ptr` means "Write for Senders, Read for Receivers"
     void *rs_wr_buffer_ptr = nullptr, *ws_rr_buffer_ptr = nullptr;
     int rs_wr_rank = 0, ws_rr_rank = 0;
+    // index与实际的行为之间的关系，可以简单分析一下:
+    // forwarder 从不同的node收数据，写出到目标 rank 中，所以应该从本地 rank（nvl_rank）读出，写入 target_rank 中
     if (warp_role == WarpRole::kRDMAAndNVLForwarder)
         rs_wr_buffer_ptr = buffer_ptrs[nvl_rank], ws_rr_buffer_ptr = buffer_ptrs[target_rank], rs_wr_rank = nvl_rank, ws_rr_rank = target_rank;
     if (warp_role == WarpRole::kNVLReceivers)
@@ -453,6 +468,9 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
         // Send number of tokens in this channel by `-value - 1`
         EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * 2 + 2 <= 32, "Invalid number of NVL peers");
+        // 一个 warp负责 send 到一个 RDMA RANK（就是不同的node），需要：（1）判定是否在当前 node内，如果在就可以直接写（类似正常的 intra node）。
+        //（2）是别的 node，则发送到对应的 send_buffer 内部。这里，先传输需要传输的 token 数量，并用负数 validity trick
+        // rdma_channel_meta 是用于 RDMA 消息收发所需要的 meta info，发送部分已经不懂了
         for (int dst_rdma_rank = warp_id; dst_rdma_rank < kNumRDMARanks; dst_rdma_rank += kNumDispatchRDMASenderWarps) {
             auto dst_ptr = dst_rdma_rank == rdma_rank ? rdma_channel_meta.recv_buffer(dst_rdma_rank) : rdma_channel_meta.send_buffer(dst_rdma_rank);
             if (lane_id < NUM_MAX_NVL_PEERS) {
@@ -464,8 +482,10 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             } else if (lane_id == NUM_MAX_NVL_PEERS * 2 + 1) {
                 dst_ptr[lane_id] = -rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id] - 1;
             }
+            // 还有一部分 thread 什么也不做
             __syncwarp();
 
+            // 发送给相同 NVL rank 的对应的 target RDMA rank 设备
             // Issue RDMA for non-local ranks
             if (dst_rdma_rank != rdma_rank) {
                 nvshmemi_ibgda_put_nbi_warp<true>(reinterpret_cast<uint64_t>(rdma_channel_meta.recv_buffer(rdma_rank)),
@@ -484,17 +504,26 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         for (token_idx = token_start_idx; token_idx < token_end_idx; ++ token_idx) {
             // Read RDMA rank existence
             uint64_t is_token_in_rank_uint64 = 0;
+            // 其中 rank 和 num_ranks 用于绝对定位，is_token_in_rank 确定了当前 node 内是否有 intranode 设备包含了对应 token
             if (lane_id < kNumRDMARanks) {
                 is_token_in_rank_uint64 = __ldg(reinterpret_cast<const uint64_t*>(is_token_in_rank + token_idx * num_ranks + lane_id * NUM_MAX_NVL_PEERS));
                 global_rdma_tail_idx += (is_token_in_rank_uint64 != 0);
             }
             __syncwarp();
 
+            // 所以对于一个 token而言，只会有一个 warp 在往下走，所以实际上是一种顺序锁
+            // 这种顺序锁操作可以使得：比如我们有warp 0，1，2三个 sender warp，
+            // 同时假设token就在 rank 中，则处理 token 0，1，2时，
+            // 恰好对应这三个 warp 进行分别处理。而根据上面的逻辑（if lane_id < k...），warp 2处理对应的 token
+            // 时，rdma_tail_idx 已经累加到2了， warp 1 和 0 同样都是累加到了对应正确的 tail 值
+
             // Skip the token which does not belong to this warp
             if ((token_idx - token_start_idx) % kNumDispatchRDMASenderWarps != warp_id)
                 continue;
             auto rdma_tail_idx = is_token_in_rank_uint64 == 0 ? -1 : global_rdma_tail_idx - 1;
 
+            // 这里的流量控制条件是什么？空出一个 slot（就是单个位置）就行，让我疑惑的是这里难道不用 chunk了？
+            // 我还以为至少在空余slot数量大于 chunk size 时停止等待
             // Wait the remote buffer to be released
             auto start_time = clock64();
             while (is_token_in_rank_uint64 != 0 and rdma_tail_idx - cached_rdma_channel_head >= num_max_rdma_chunked_recv_tokens) {
@@ -509,6 +538,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             }
             __syncwarp();
 
+            // send_head 是为了 combine 阶段 2D 数据写入 barrier：所有的 tail 都超过对应的 send head，就说明 combine 所需的数据已经写入到 buffer
             // Store RDMA head for combine
             if (lane_id < kNumRDMARanks and not kCachedMode)
                 send_rdma_head[token_idx * kNumRDMARanks + lane_id] = rdma_tail_idx;
@@ -529,6 +559,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             }
             EP_DEVICE_ASSERT(num_topk_ranks <= kNumTopkRDMARanks);
 
+            // 接下来发送 top k token 的各项信息
             // Copy `x` into symmetric send buffer
             auto st_broadcast = [=](const int key, const int4& value) {
                 #pragma unroll
@@ -571,6 +602,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             }
             __syncwarp();
 
+            /// TODO: 这里怎么一言不合就用锁了，好像是与 sender coordinator 有关，开始绕起来了
             // Release the transaction in the window
             if (is_token_in_rank_uint64 != 0) {
                 // Acquire lock first
@@ -600,6 +632,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             __syncwarp();
         }
     } else if (warp_role == WarpRole::kRDMASenderCoordinator) {
+        // Sender coordinator 只有一个 warp。用于将 sender buffer 中的内容搬运到 forwarder 处（不同 RDMA rank，相同 NVL rank）
         // NOTES: in case of splitting, the issued put at the end of the buffer
         EP_DEVICE_ASSERT(num_max_rdma_chunked_recv_tokens % num_max_rdma_chunked_send_tokens == 0);
 
@@ -612,6 +645,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         // Synchronize shared memory
         sync_rdma_sender_smem();
 
+        // 获得发向 rank i（RDMA）的 token 数量，prefix 差分就是每个 rank 对应的 token 数量
         // Get number of tokens to send for each RDMA rank
         int num_tokens_to_send = 0;
         if (lane_id < kNumRDMARanks) {
@@ -639,11 +673,14 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 if (synced_num_tokens_to_send == 0)
                     continue;
 
+                // 这是在查 Sender 是否完成了数据准备，rdma_send_channel_tail 在 sender 的末尾会进行更新（那个有锁的抽象区域）
                 // Read the latest progress
                 // NOTES: `rdma_send_channel_tail` does not need to be protected by lock
                 auto processed_tail = __shfl_sync(0xffffffff, ld_acquire_cta(const_cast<const int*>(rdma_send_channel_tail + dst_rdma_rank)), 0);
                 auto synced_last_issued_tail = __shfl_sync(0xffffffff, last_issued_tail, dst_rdma_rank);
                 auto num_tokens_processed = processed_tail - synced_last_issued_tail;
+                // 判断数据准备是否完备：（1）需要发送的数据是否等于 ready 数据？（2）需要发送数据是否大于 chunk size？
+                /// TODO: continue？continue 不等于丢包了？
                 if (num_tokens_processed != synced_num_tokens_to_send and num_tokens_processed < num_max_rdma_chunked_send_tokens)
                     continue;
 
