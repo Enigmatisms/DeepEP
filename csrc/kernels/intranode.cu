@@ -8,6 +8,17 @@ namespace deep_ep {
 
 namespace intranode {
 
+/**
+ * 节点内 dispatch 操作
+ * 没加 recv 就是指发出去的token数量
+ * 加了 mapped 就是在 CPU 上的, 估计来自于 cudaMallocManaged 这样的操作
+ * 
+ * @param num_tokens_per_rank 给每个 rank 发送的 token 数量
+ * @param num_tokens_per_expert 给每个 expert 发送的 token 数量
+ * @param moe_recv_counter_mapped CPU 上当前 rank 收到的 token 数量
+ * @param moe_recv_expert_counter_mapped CPU 上当前 rank 每个expert 收到的 token 数量
+ * @param num_nodes 固定设置 4096
+*/
 template<int kNumRanks>
 __global__ void
 notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
@@ -19,6 +30,8 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
     auto thread_id = static_cast<int>(threadIdx.x), num_threads = static_cast<int>(blockDim.x);
     auto lane_id = thread_id % 32, warp_id = thread_id / 32, num_warps = num_threads / 32;
 
+    // block 0 做大量的准备工作，包括：取 number of token 并记录在 per_rank_buffer 中（多 rank），local
+    // prefix sum 用于后续的 sending（确定 receiver 写入位置），返回信息（比如 rank、expert 总token）到 CPU
     if (sm_id == 0) {
         // Barrier first
         barrier_block<kNumRanks, true>(barrier_signal_ptrs, rank);
@@ -42,6 +55,8 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
                 per_expert_buffer[rank * num_experts_per_rank + i] = num_tokens_per_expert[thread_id * num_experts_per_rank + i];
         }
 
+        // per_rank_buffer 以及 expert buffer 是多个 rank 的 kernel 一起维护
+
         // Wait for all ranks to be finished
         barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
 
@@ -49,9 +64,11 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
         // Also pre-compute the prefix sum for data sending
         auto local_per_rank_buffer = static_cast<int*>(buffer_ptrs[rank]);
         if (thread_id < kNumRanks) {
+            // prefix sum: 用于确定 receiver 端的写入位置
             #pragma unroll
             for (int i = 1; i < kNumRanks; ++ i)
                 local_per_rank_buffer[i * kNumRanks + thread_id] += local_per_rank_buffer[(i - 1) * kNumRanks + thread_id];
+            // 返回 prefix sum 的最后一个值（全部和）到CPU
             if (thread_id == rank)
                 *moe_recv_counter_mapped = local_per_rank_buffer[(kNumRanks - 1) * kNumRanks + rank];
         }
@@ -81,9 +98,12 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
         // Barrier
         barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
     } else {
+        // 目前的理解：block 两两一对（send = i， receive = i + 1），一对 warp 对应一个 channel
+        // channel 其实就是一个软件概念，没有专用的物理载体
         int dst_rank = sm_id - 1;
         for (int channel_id = warp_id; channel_id < num_channels; channel_id += num_warps) {
             int token_start_idx, token_end_idx;
+            // 划分读取 token 的任务范围
             get_channel_task_range(num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
 
             // Iterate over tokens
@@ -91,12 +111,14 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
             for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += 32)
                 count += is_token_in_rank[i * kNumRanks + dst_rank];
             count = warp_reduce_sum(count);
+            // 确定当前 channel（一个 warp）需要发送的 token 数量
             if (lane_id == 0)
                 channel_prefix_matrix[dst_rank * num_channels + channel_id] = count;
         }
         __syncthreads();
 
         // Pre-compute prefix sum for all channels
+        // 发送准备，channel 需要确定对应 receiver 数据存储的起始位置偏移
         if (thread_id == 0) {
             #pragma unroll
             for (int i = 1; i < num_channels; ++ i)
@@ -105,6 +127,8 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped,
     }
 }
 
+// notify_dispatch kernel host caller，notify_dispatch 本身没有做 dispatch 操作，不是 sender 和 receiver 逻辑
+// 是一个数据准备的 kernel，故称: notify “我要开始了！”
 void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, int num_ranks,
                      const int* num_tokens_per_expert, int* moe_recv_expert_counter_mapped, int num_experts,
                      int num_tokens, const bool* is_token_in_rank, int* channel_prefix_matrix,
@@ -163,6 +187,20 @@ void cached_notify_dispatch(const int* rank_prefix_matrix, int num_memset_int,
 #undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
 }
 
+
+/**
+ * 真正的 sender/receiver 逻辑，偶数 block sender，奇数 block receiver
+ * launch config: 
+ * 
+ * kNumRanks: 8(可变)
+ * kNumThreads: 768 固定（24 warps）
+ * 
+ * @param recv_x: receiver 写入的 token buffer
+ * @param recv_x_scales: 具体作用需要看模型的算法逻辑
+ * @param recv_src_idx: 
+ * @param num_recv_buffer_tokens: 应该就是 B（receiver buffer 单个 channel 的大小）
+ * @param hidden_int4: 每个 token 的 hidden dim 维度 占用多少个 int4 （估计是用128bit传输）
+*/
 template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
 __global__ void __launch_bounds__(kNumThreads, 1)
 dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_topk_idx, float* recv_topk_weights, int* recv_channel_offset,
@@ -180,6 +218,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
     // Several warps are response for a single rank
     const auto num_threads_per_rank = kNumThreads / kNumRanks;
     const auto num_channels = num_sms / 2;
+    // 比如：一个rank分配三个 warp，那么同一个 block 内可能会出现多个不同 rank
     const auto responsible_rank = (static_cast<int>(thread_id)) / num_threads_per_rank;
     // Even-numbered blocks for sending, odd-numbered blocks for receiving.
     const auto responsible_channel = sm_id / 2;
@@ -196,6 +235,14 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
     int target_rank = is_sender ? rank : responsible_rank;
     auto num_channels_total = num_channels * kNumRanks;
     auto channel_rank_offset = responsible_channel * kNumRanks + target_rank;
+
+    // head/tail 分离设计，其实我个人感觉从物理存储上看“分离”并没有体现得那么明显
+    // 毕竟 head 与 tail 实际上都是存在 global memory 中的，但：
+    // sender 不以 shared 或者 register 形式在 thread local 中 cache 一个 head，每次都是直接读取
+    //      而 tail 是通过 register（不 spill 的话）保存，最后进行修改的
+    // receiver 则相反，head 是通过 register 保存，tail 虽然看似也有对应的 register 位置以及 smem 存储
+    //      但实际上只是为了加速访问，并没有高频率更新 tail 的 cache 值。
+    // 从 local caching 的角度上看，确实是分离的：sender 维护 tail，receiver 维护 head
 
     // Channel buffer metadata
     // Senders are responsible for tails, and receivers are responsible for heads
@@ -250,6 +297,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
 
         // Send offset by `-value - 1`, e.g. 0 -> -1, 1 -> -2
         // NOTES: this is for distinguishing zero tokens
+
+        // 由于 sender 和 receiver 在不同 block，所以需要在 global 空间下设置 start/end offset
         if (lane_id == 0 and send_warp_id_in_rank == 0) {
             int value = responsible_channel > 0 ? channel_prefix_matrix[responsible_rank * num_channels + responsible_channel - 1] : 0;
             st_relaxed_sys_global(channel_start_offset.buffer(), -value - 1);
@@ -262,15 +311,20 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
         int token_start_idx, token_end_idx;
         get_channel_task_range(num_tokens, num_channels, responsible_channel, token_start_idx, token_end_idx);
 
+        // 流量控制与分块发送，批量写入减少分支与同步需求，而且通信与内存事务没有那么稀碎
         // Iterate over all tokens and send by chunks
         int cached_channel_tail_idx = 0;
         for (int64_t token_idx = token_start_idx; token_idx < token_end_idx; ) {
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             // NOTES: the head index received by different warps may not be the same
+
+            // 等待对应 chunk 空（可写入状态检查）
             auto start_time = clock64();
             while (lane_id == 0) {
                 // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
+                // 使用 volatile by pass cache 以免 cache 被通信 flags 污染影响速度
                 int num_used_slots = cached_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
+                // 等待 channel 的可写入空间大与一次性可以发送的最大 token 数量再发送
                 if (num_recv_buffer_tokens - num_used_slots >= num_max_send_tokens)
                     break;
 
@@ -282,6 +336,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
             }
             __syncwarp();
 
+            // 发送。发送过程：（1）维护 send_head (combine 操作的 receiver 开始向recv_x 写下一个token数据的条件)，并判断当前 token 是否发送。
+            // (2)  warp copy tokens，相关的 source index 以及 topk index/weight 和 x scale，最后发送 buffer tail index
             int chunk_token_idx = 0;
             while (chunk_token_idx < num_max_send_tokens and token_idx < token_end_idx) {
                 // NOTES: for the same token, the warp assigned to save `send_head` may be different from the warp assigned to send the following data
@@ -303,6 +359,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
                     UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_channel_x_buffers, shifted_x, __ldg, st_na_global);
 
                     // Copy source index
+
+                    // source index 的作用是 (MoE 的知识了): 记录 token 在 batch 中的原始位置，用于后续的可逆重组
                     if (lane_id == 0)
                         channel_src_idx_buffers[dst_slot_idx] = static_cast<int>(token_idx);
 
@@ -332,6 +390,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
                 chunk_token_idx ++, token_idx ++;
             }
 
+            // 这里应该是通知 receiver（对应的 +1 block_id）tail 发生了移动，以便 consumer 进行有效性判定
             // Move tail index
             // NOTES: here all warps should share the same new tail
             asm volatile("bar.sync %0, %1;" :: "r"(responsible_rank), "r"(num_threads_per_rank));
@@ -354,18 +413,22 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
 
         // Receive channel offset
         int total_offset, num_tokens_to_recv;
+        // 这里是读取 sender 写入的 channel_prefix matrix，也即获得 token 写入 recv_x 的位置
         while (lane_id == 0 and (total_offset = ld_volatile_global(channel_start_offset.buffer())) == 0);
         while (lane_id == 0 and (num_tokens_to_recv = ld_volatile_global(channel_end_offset.buffer())) == 0);
         if (lane_id == 0) {
+            // 负数 valid 判断 trick
             total_offset = -total_offset - 1, num_tokens_to_recv = -num_tokens_to_recv - 1;
             if (recv_warp_id_in_rank == 0)
                 recv_channel_offset[responsible_rank * num_channels + responsible_channel] = total_offset;
             num_tokens_to_recv -= total_offset;
         }
+        // 从 lane 0 取 total offset（lane 0广播）
         total_offset = __shfl_sync(0xffffffff, total_offset, 0);
         total_offset += rank_offset;
         num_tokens_to_recv = __shfl_sync(0xffffffff, num_tokens_to_recv, 0);
 
+        // 多个warp处理一个 rank（比如3个warp）
         // Shared tail indices for different warps
         __shared__ volatile int shared_channel_tail_idx[kNumRanks];
 
@@ -377,6 +440,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
                 cached_channel_tail_idx = ld_acquire_sys_global(channel_tail_idx.buffer());
 
                 // Ready to copy
+                // 由 sender block 写入的 channel_tail_idx，见 sender 逻辑的末尾
                 if (cached_channel_head_idx != cached_channel_tail_idx) {
                     shared_channel_tail_idx[responsible_rank] = cached_channel_tail_idx;
                     break;
@@ -393,6 +457,10 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
             asm volatile("bar.sync %0, %1;" :: "r"(responsible_rank), "r"(num_threads_per_rank));
             cached_channel_tail_idx = shared_channel_tail_idx[responsible_rank];
 
+            // 注意收发都是 chunk 式的，每个 warp 负责一个 chunk，warp 内连续，chunk 间随着 warp 连续
+            // 一个 chunk 代表了一个 token，如果 hidden 按照 7168 来算，7168 对应了 1792 个 int4
+            // 不考虑 TMA，unrolled warp 也会全数 copy 完（unrolled warp 的 N 就是 hidden_int4），说明
+            // 这里一个 warp 负责了一个 chunk（token）的 copy
             // Copy data
             int num_recv_tokens = cached_channel_tail_idx - cached_channel_head_idx;
             for (int chunk_idx = recv_warp_id_in_rank; chunk_idx < num_recv_tokens; chunk_idx += num_recv_warps_per_rank) {
@@ -440,6 +508,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* recv_to
                         ld_nc_global(channel_x_scales_buffers.buffer() + token_idx_in_buffer * num_scales + scales_idx);
             }
 
+            // 更新循环队列
             // Move queue
             cached_channel_head_idx += num_recv_tokens;
             total_offset += num_recv_tokens;
@@ -539,6 +608,8 @@ cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels, int 
 
         // NOTES: `1 << 25` is a heuristic large number
         int last_head = 1 << 25;
+        // 这个 unroll 有用吗，不是 compile time 已知的循环次数
+        // 这里对 send_head 进行处理：
         #pragma unroll
         for (int token_idx_tail = token_end_idx - 1; token_idx_tail >= token_start_idx; token_idx_tail -= 32) {
             int token_idx = token_idx_tail - lane_id, expected_head = 0;
@@ -546,6 +617,8 @@ cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels, int 
             for (int i = 0; i < min(32, token_idx_tail - token_start_idx + 1); ++ i) {
                 const int head = __shfl_sync(0xffffffff, current_head, i);
                 if (head < 0) {
+                    // expected_head 一直是负的，估计是为了保留一定的信息: 此值是经过重写的
+                    // 代码逻辑貌似是在修复小于 0 的值，同时记录下“修复过”这个信息（负数），具体的逻辑还是有点绕
                     if (lane_id == i)
                         expected_head = -last_head - 1;
                 } else {
@@ -643,12 +716,14 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
         int num_channel_tokens = (responsible_channel == num_channels - 1 ? num_rank_tokens : channel_prefix_matrix[send_rank_id * num_channels + responsible_channel + 1]) - channel_offset;
         int token_start_idx = rank_offset + channel_offset, token_end_idx = rank_offset + channel_offset + num_channel_tokens;
 
+        // sender 发送给其他 expert（ranks）进行计算的 token 都要收回来，也是按顺序接收写入的
         // Iterate over all tokens and send by chunks
         int current_channel_tail_idx = 0;
         for (int64_t token_idx = token_start_idx; token_idx < token_end_idx; ) {
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             auto start_time = clock64();
             int num_round_tokens = min(num_max_send_tokens, token_end_idx - static_cast<int>(token_idx));
+            // 等待 chunk 大小的数据可读
             while (lane_id == 0) {
                 // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
                 int num_used_slots = current_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
@@ -663,6 +738,8 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
             }
             __syncwarp();
 
+            // 从当前剩余需要发送的 token 中取出。注意，sender 也是多个 warp（3）处理一个 rank，一个 warp 负责一个 token
+            // 所以当前 warp 要获取对应的 token id 则是以 send warp 数量为 stride 的
             // Send by chunk
             #pragma unroll
             for (int i = send_warp_id_in_rank; i < num_round_tokens; i += num_send_warps_per_rank) {
@@ -698,6 +775,8 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
         EP_DEVICE_ASSERT(kNumRanks <= 32 and kNumThreads > 32);
         EP_DEVICE_ASSERT(thread_id >= 0 and kNumThreads % 32 == 0);
 
+        // 退休机制可还行，具体作用是: block 内信号量，receiver coordinator 什么时候不需要工作？
+        // 当所有的 receiver warp 都退休了，此时就可以退休了。可怜的 coordinator 是被延迟退休了
         // Shared head, tail and retired flags for receiver warps
         __shared__ volatile int warp_channel_head_idx[num_recv_warps][kNumRanks];
         __shared__ volatile int channel_tail_idx[kNumRanks];
@@ -710,10 +789,19 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
             channel_tail_idx[thread_id] = 0;
         asm volatile("bar.sync 0, %0;" :: "r"(kNumThreads));
 
+        // warp 0 是 combine 的 receiver coordinator，用于更新 head，并且从 gmem 中
+        // 读取 tail 的值（一共需要读取 num_ranks 个 tail值，因为要做 intra node reduce）
+        // 此 warp 一直在读取 warp_channel_head_idx，具体作用: 
         if (thread_id < 32) {
             int* channel_head_idx_ptr = static_cast<int*>(buffer_ptrs[rank]) + responsible_channel * kNumRanks + lane_id;
             int* channel_tail_idx_ptr = channel_head_idx_ptr + num_channels * kNumRanks;
 
+            // 所以，receive coordinator warp 一直在轮询获得所有 warp 从 各个 rank 读取的 min head
+            // 由于当前处理 channel 的 head 不一定在被哪个 receiver warp 处理，所以需要看所有 receiver warp
+            // 在各个 rank 上的 head，获得其最小值，如果所有 warp 的 head 最小值都超过了 last head，说明
+            // head 位置可以发生移动了。注意，有效的只有 rank 内的所有 thread，相当于每个 rank 读取 recv buffer 时会有一个
+            // head，所有 warp 在处理对应 rank 时，只需要自己的 warp_head[warp_id][lane_id(=rank-to-test)] > last_head
+            // 那么对应 rank 的 head 就会发生移动
             // Queue head updater
             int last_head = 0;
             while (lane_id < kNumRanks) {
@@ -727,9 +815,13 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
 
                 // Update queue tail
                 channel_tail_idx[lane_id] = ld_acquire_sys_global(channel_tail_idx_ptr);
-
+                
                 // Update minimum head
                 int min_head = std::numeric_limits<int>::max();
+                // warp_channel_head_idx 大小是 [num_recv_warps] * [kNumRanks]
+                // 每个实际的 receiver warp 可能都有不同的 local head。每个receiver warp 也要同时看不同的rank，
+                // 原因: 一个 warp 负责一个 token 的写入（也即一个 chunk，这一点与 sender 对称），那么就需要 
+                // 从不同的 rank 进行 reduce
                 #pragma unroll
                 for (int i = 1; i < num_recv_warps; ++ i) if (not warp_retired[i])
                     min_head = min(min_head, warp_channel_head_idx[i][lane_id]);
@@ -765,6 +857,8 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
             int token_start_idx, token_end_idx;
             get_channel_task_range(num_recv_tokens, num_channels, responsible_channel, token_start_idx, token_end_idx);
 
+            // 几乎还是每个 warp 使用了 num_ranks * sender_warp_num 的配置，比如 sender 在一个 rank 上用3个，那么这边就基本为 3 * num_ranks
+            // num_recv_warps - 1 是为了排除第一个 receiver coordindator warp
             // Iterate over all tokens and combine
             for (int64_t token_idx = token_start_idx + recv_warp_id - 1; token_idx < token_end_idx; token_idx += num_recv_warps - 1) {
                 // Read expected head
@@ -772,6 +866,8 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 if (lane_id < kNumRanks)
                     expected_head = ld_nc_global(send_head + token_idx * kNumRanks + lane_id);
 
+                // 等待该 token 对应的位置（expect head）被 tail 超过（写入），实际上同步的是 warp 内 lane_id < kNumRanks 
+                // 的所有线程的状态: 所有的 tail 都大于 expected head，说明对应 token 需要 reduce 的数据已经全部写入
                 auto start_time = clock64();
                 while (__any_sync(0xffffffff, channel_tail_idx[lane_id] <= expected_head and expected_head >= 0)) {
                     // Timeout check
@@ -782,6 +878,9 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 }
                 __syncwarp();
 
+                // 当前 lane 与 lane_id < kNumRanks 的所有线程进行 head 数据交换，
+                // 记录下所有需要 reduce 的 rank 的 slot index，并且把 topk ranks也全部记下
+                // slot index 用于 reduce 阶段查找对应 token 在 receiver buffer 的位置
                 // Broadcast current heads
                 int num_topk_ranks = 0, topk_ranks[kNumRanks], slot_indices[kNumRanks];
                 #pragma unroll
@@ -803,6 +902,8 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                 // Reduce data with pipeline
                 constexpr int kNumStages = 8;
                 EP_STATIC_ASSERT(kNumStages * 32 * sizeof(int4) <= kNumTMABytesPerWarp, "Invalid count");
+                // 这里的 warp 内并行配置是: 一个 warp 将 hidden 维度作 spatial inner loop 展开，
+                // 每个 lane 负责一个 int4，跨 warp（512B）进行处理
                 #pragma unroll
                 for (int i = lane_id; i < hidden_int4; i += 32) {
                     // Read bias
@@ -816,6 +917,7 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                     for (int j = 0; j < num_topk_ranks; ++ j)
                         recv_value_int4[j] = ld_nc_global(channel_x_buffers[topk_ranks[j]].buffer() + slot_indices[j] * hidden_int4 + i);
 
+                    // 比如用 BF16 存储的 combine，一次读取将读取 1个 int4，可以拆分为 8 个 BF16 值，进行 reduce
                     // Reduce bias
                     float values[kDtypePerInt4];
                     auto bias_0_values = reinterpret_cast<const dtype_t*>(&bias_0_value_int4);
@@ -873,6 +975,8 @@ combine(dtype_t* recv_x, float* recv_topk_weights,
                     recv_topk_weights[token_idx * num_topk + lane_id] = value;
                 }
 
+                // 这里和 send head 在 cached_notify_combine 上的逻辑是有关系的，其中有些 head 是
+                // “修复过”的 head，这个修复操作具体代表什么还需要深入理解分析。
                 // Update head
                 if (lane_id < kNumRanks)
                     warp_channel_head_idx[recv_warp_id][lane_id] = (expected_head < 0) ? -expected_head - 1 : expected_head + 1;
